@@ -1,0 +1,6 @@
+aiogram
+pyTelegramBotAPI
+aiosqlite
+requests
+python-dotenv
+pillow
