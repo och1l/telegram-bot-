@@ -118,6 +118,45 @@ def norm_username(u: str) -> str:
 
 
 # ---------------- ROL ANIQLASH ----------------
+async def apply_role(db, telegram_id: int, role: str, object_id: int, full_name: str | None):
+    """Berilgan telegram_id'ga to'g'ridan-to'g'ri rol beradi (admin/manager/cook)."""
+    if role == "admin":
+        await db.execute("UPDATE objects SET owner_id = ? WHERE id = ?", (telegram_id, object_id))
+    elif role == "manager":
+        await db.execute(
+            "INSERT OR REPLACE INTO managers (telegram_id, object_id, full_name) VALUES (?, ?, ?)",
+            (telegram_id, object_id, full_name),
+        )
+    elif role == "cook":
+        async with db.execute(
+            "SELECT group_id FROM cooks WHERE telegram_id = ?", (telegram_id,)
+        ) as c2:
+            existing = await c2.fetchone()
+
+        async with db.execute(
+            "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
+        ) as c3:
+            object_group = await c3.fetchone()
+
+        if object_group:
+            group_id = object_group[0]
+        elif existing:
+            group_id = existing[0]
+        else:
+            cur2 = await db.execute("INSERT INTO cook_groups DEFAULT VALUES")
+            group_id = cur2.lastrowid
+
+        await db.execute(
+            "INSERT OR REPLACE INTO cooks (telegram_id, group_id, full_name) VALUES (?, ?, ?)",
+            (telegram_id, group_id, full_name),
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO object_cook_group (object_id, group_id) VALUES (?, ?)",
+            (object_id, group_id),
+        )
+    await db.commit()
+
+
 async def resolve_pending(db, telegram_id: int, username: str | None):
     """Agar shu username uchun kutilayotgan rol bo'lsa, uni haqiqiy jadvalga o'tkazadi."""
     if not username:
@@ -129,44 +168,7 @@ async def resolve_pending(db, telegram_id: int, username: str | None):
         rows = await cur.fetchall()
 
     for rowid, role, object_id, full_name in rows:
-        if role == "admin":
-            await db.execute("UPDATE objects SET owner_id = ? WHERE id = ?", (telegram_id, object_id))
-        elif role == "manager":
-            await db.execute(
-                "INSERT OR REPLACE INTO managers (telegram_id, object_id, full_name) VALUES (?, ?, ?)",
-                (telegram_id, object_id, full_name),
-            )
-        elif role == "cook":
-            # Agar bu odam allaqachon boshqa joyda oshpaz bo'lsa, o'sha guruhini ishlatamiz.
-            async with db.execute(
-                "SELECT group_id FROM cooks WHERE telegram_id = ?", (telegram_id,)
-            ) as c2:
-                existing = await c2.fetchone()
-
-            # Agar bu OBYEKT allaqachon biror guruhga bog'langan bo'lsa (masalan boshqa
-            # oshpaz orqali), yangi oshpazni ham O'SHA guruhga qo'shamiz — shunda bitta
-            # obyektga bir nechta oshpaz (4 tagacha va undan ko'p ham) biriktirilishi mumkin.
-            async with db.execute(
-                "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
-            ) as c3:
-                object_group = await c3.fetchone()
-
-            if object_group:
-                group_id = object_group[0]
-            elif existing:
-                group_id = existing[0]
-            else:
-                cur2 = await db.execute("INSERT INTO cook_groups DEFAULT VALUES")
-                group_id = cur2.lastrowid
-
-            await db.execute(
-                "INSERT OR REPLACE INTO cooks (telegram_id, group_id, full_name) VALUES (?, ?, ?)",
-                (telegram_id, group_id, full_name),
-            )
-            await db.execute(
-                "INSERT OR REPLACE INTO object_cook_group (object_id, group_id) VALUES (?, ?)",
-                (object_id, group_id),
-            )
+        await apply_role(db, telegram_id, role, object_id, full_name)
         await db.execute("DELETE FROM pending_roles WHERE rowid = ?", (rowid,))
     await db.commit()
 
@@ -320,13 +322,27 @@ async def obj_name_entered(message: types.Message, state: FSMContext):
 @dp.message(StateFilter(Form.obj_owner_username))
 async def obj_owner_entered(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    username = norm_username(message.text)
+    raw = message.text.strip()
 
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
             "INSERT INTO objects (nomi, owner_id) VALUES (?, NULL)", (data["obj_name"],)
         )
         object_id = cur.lastrowid
+
+        if raw.lstrip("-").isdigit():
+            # Raqamli Telegram ID kiritilgan — darhol tayinlaymiz, kutish shart emas
+            owner_id = int(raw)
+            await db.execute("UPDATE objects SET owner_id = ? WHERE id = ?", (owner_id, object_id))
+            await db.commit()
+            await state.clear()
+            return await message.answer(
+                f"✅ '{data['obj_name']}' obyekti yaratildi va ID {owner_id} darhol egasi qilib "
+                f"tayinlandi. U /start bossa, paneli ochiladi.",
+                reply_markup=super_menu(),
+            )
+
+        username = norm_username(raw)
         await db.execute(
             "INSERT INTO pending_roles (username, role, object_id) VALUES (?, 'admin', ?)",
             (username, object_id),
@@ -336,7 +352,10 @@ async def obj_owner_entered(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ '{data['obj_name']}' obyekti yaratildi.\n"
-        f"@{username} birinchi marta botga /start bosganida, u avtomatik shu obyekt egasi bo'ladi.",
+        f"@{username} birinchi marta botga /start bosganida, u avtomatik shu obyekt egasi bo'ladi.\n\n"
+        f"⚠️ Agar @{username}da Telegram username o'rnatilmagan bo'lsa, bu ISHLAMAYDI. "
+        f"Bunday holda o'sha odamdan @userinfobot orqali raqamli ID olib, shu joyga username "
+        f"o'rniga o'sha RAQAMni kiritish kerak edi.",
         reply_markup=super_menu(),
     )
 
@@ -389,7 +408,8 @@ async def emp_role_picked(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(StateFilter(Form.emp_username))
 async def emp_username_entered(message: types.Message, state: FSMContext):
-    await state.update_data(username=norm_username(message.text))
+    raw = message.text.strip()
+    await state.update_data(raw_input=raw)
     await state.set_state(Form.emp_fullname)
     await message.answer("Xodimning F.I.Sh (Familiya Ism) kiriting (masalan: Sheraliyev Abror):")
 
@@ -399,10 +419,23 @@ async def emp_fullname_entered(message: types.Message, state: FSMContext):
     data = await state.get_data()
     object_id = data["object_id"]
     role = data["role"]
-    username = data["username"]
+    raw = data["raw_input"]
     full_name = message.text.strip()
+    role_label = "Ish boshqaruvchi" if role == "manager" else "Oshpaz"
 
     async with aiosqlite.connect(DB_NAME) as db:
+        if raw.lstrip("-").isdigit():
+            # Raqamli Telegram ID kiritilgan — darhol tayinlaymiz, username shart emas
+            telegram_id = int(raw)
+            await apply_role(db, telegram_id, role, object_id, full_name)
+            await state.clear()
+            return await message.answer(
+                f"✅ ID {telegram_id} ({full_name}) {role_label.lower()} sifatida darhol tayinlandi. "
+                f"U /start bossa, paneli ochiladi.",
+                reply_markup=admin_menu(object_id),
+            )
+
+        username = norm_username(raw)
         await db.execute(
             "INSERT INTO pending_roles (username, role, object_id, full_name) VALUES (?, ?, ?, ?)",
             (username, role, object_id, full_name),
@@ -410,10 +443,11 @@ async def emp_fullname_entered(message: types.Message, state: FSMContext):
         await db.commit()
 
     await state.clear()
-    role_label = "Ish boshqaruvchi" if role == "manager" else "Oshpaz"
     await message.answer(
         f"✅ @{username} ({full_name}) {role_label.lower()} sifatida belgilandi. "
-        f"U /start bosganida panel avtomatik ochiladi.",
+        f"U /start bosganida panel avtomatik ochiladi.\n\n"
+        f"⚠️ Agar @{username}da Telegram username o'rnatilmagan bo'lsa, bu ISHLAMAYDI — "
+        f"bunday holda uning @userinfobot orqali olingan raqamli ID'sini kiriting.",
         reply_markup=admin_menu(object_id),
     )
 
