@@ -40,6 +40,8 @@ class Form(StatesGroup):
     add_cook_username = State()
     merge_cook_username = State()
     payment_amount = State()
+    emp_username = State()
+    emp_fullname = State()
 
 
 # ---------------- BAZA ----------------
@@ -51,14 +53,14 @@ async def init_db():
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS managers ("
-            "telegram_id INTEGER PRIMARY KEY, object_id INTEGER)"
+            "telegram_id INTEGER PRIMARY KEY, object_id INTEGER, full_name TEXT)"
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS cook_groups (id INTEGER PRIMARY KEY AUTOINCREMENT)"
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS cooks ("
-            "telegram_id INTEGER PRIMARY KEY, group_id INTEGER)"
+            "telegram_id INTEGER PRIMARY KEY, group_id INTEGER, full_name TEXT)"
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS object_cook_group ("
@@ -80,7 +82,7 @@ async def init_db():
         # username orqali hali telegram_id'si noma'lum odamlarni "kutish" jadvali
         await db.execute(
             "CREATE TABLE IF NOT EXISTS pending_roles ("
-            "username TEXT, role TEXT, object_id INTEGER)"
+            "username TEXT, role TEXT, object_id INTEGER, full_name TEXT)"
         )
         # har bir botga murojaat qilgan odamning username'ini eslab qolish uchun
         await db.execute(
@@ -115,17 +117,17 @@ async def resolve_pending(db, telegram_id: int, username: str | None):
         return
     uname = norm_username(username)
     async with db.execute(
-        "SELECT rowid, role, object_id FROM pending_roles WHERE username = ?", (uname,)
+        "SELECT rowid, role, object_id, full_name FROM pending_roles WHERE username = ?", (uname,)
     ) as cur:
         rows = await cur.fetchall()
 
-    for rowid, role, object_id in rows:
+    for rowid, role, object_id, full_name in rows:
         if role == "admin":
             await db.execute("UPDATE objects SET owner_id = ? WHERE id = ?", (telegram_id, object_id))
         elif role == "manager":
             await db.execute(
-                "INSERT OR REPLACE INTO managers (telegram_id, object_id) VALUES (?, ?)",
-                (telegram_id, object_id),
+                "INSERT OR REPLACE INTO managers (telegram_id, object_id, full_name) VALUES (?, ?, ?)",
+                (telegram_id, object_id, full_name),
             )
         elif role == "cook":
             # Agar bu odam allaqachon boshqa joyda oshpaz bo'lsa, o'sha guruhini ishlatamiz.
@@ -151,8 +153,8 @@ async def resolve_pending(db, telegram_id: int, username: str | None):
                 group_id = cur2.lastrowid
 
             await db.execute(
-                "INSERT OR REPLACE INTO cooks (telegram_id, group_id) VALUES (?, ?)",
-                (telegram_id, group_id),
+                "INSERT OR REPLACE INTO cooks (telegram_id, group_id, full_name) VALUES (?, ?, ?)",
+                (telegram_id, group_id, full_name),
             )
             await db.execute(
                 "INSERT OR REPLACE INTO object_cook_group (object_id, group_id) VALUES (?, ?)",
@@ -198,15 +200,15 @@ def super_menu():
     b = InlineKeyboardBuilder()
     b.button(text="🏗 Obyekt qo'shish", callback_data="sadmin_add_object")
     b.button(text="📋 Obyektlar ro'yxati", callback_data="sadmin_list_objects")
+    b.button(text="🔗 Obyektlarni birlashtirish", callback_data="sadmin_merge_pick")
     b.adjust(1)
     return b.as_markup()
 
 
 def admin_menu(object_id: int):
     b = InlineKeyboardBuilder()
-    b.button(text="👷 Ish boshqaruvchi tayinlash", callback_data=f"admin_addmgr_{object_id}")
-    b.button(text="👨‍🍳 Oshpaz tayinlash", callback_data=f"admin_addcook_{object_id}")
-    b.button(text="🔗 Oshpazlarni birlashtirish", callback_data=f"admin_merge_{object_id}")
+    b.button(text="➕ Xodim qo'shish", callback_data=f"emp_add_{object_id}")
+    b.button(text="📋 Xodimlar ro'yxati", callback_data=f"emp_list_{object_id}")
     b.button(text="📊 Hisobot", callback_data=f"admin_report_{object_id}")
     b.adjust(1)
     return b.as_markup()
@@ -283,10 +285,7 @@ async def start(message: types.Message, state: FSMContext):
     elif role == "cook":
         await show_cook_report(message.from_user.id, message)
     else:
-        await message.answer(
-            "Sizga hali hech qanday rol biriktirilmagan. Obyekt egasi yoki bosh admin sizni "
-            "tizimga qo'shishi kerak."
-        )
+        await message.answer("🔑 Parolni kiriting:")
 
 
 @dp.callback_query(F.data.startswith("admin_select_"))
@@ -356,69 +355,136 @@ async def sadmin_back(call: types.CallbackQuery):
 
 
 # ---------------- ADMIN: ISH BOSHQARUVCHI TAYINLASH ----------------
-@dp.callback_query(F.data.startswith("admin_addmgr_"))
-async def admin_addmgr(call: types.CallbackQuery, state: FSMContext):
+# ---------------- OBYEKT EGASI: XODIM QO'SHISH (birlashtirilgan) ----------------
+@dp.callback_query(F.data.startswith("emp_add_"))
+async def emp_add(call: types.CallbackQuery, state: FSMContext):
     object_id = int(call.data.split("_")[-1])
-    await state.update_data(object_id=object_id)
-    await state.set_state(Form.add_manager_username)
-    await call.message.edit_text("Ish boshqaruvchining Telegram username'ini kiriting:")
+    b = InlineKeyboardBuilder()
+    b.button(text="👷 Ish boshqaruvchi", callback_data=f"emp_role_manager_{object_id}")
+    b.button(text="👨‍🍳 Oshpaz", callback_data=f"emp_role_cook_{object_id}")
+    b.button(text="⬅️ Ortga", callback_data=f"admin_select_{object_id}")
+    b.adjust(1)
+    await call.message.edit_text("Qaysi lavozimga xodim qo'shasiz?", reply_markup=b.as_markup())
     await call.answer()
 
 
-@dp.message(StateFilter(Form.add_manager_username))
-async def add_manager_entered(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    username = norm_username(message.text)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO pending_roles (username, role, object_id) VALUES (?, 'manager', ?)",
-            (username, data["object_id"]),
-        )
-        await db.commit()
-    await state.clear()
-    await message.answer(
-        f"✅ @{username} ish boshqaruvchi sifatida belgilandi. U /start bosganida panel ochiladi.",
-        reply_markup=admin_menu(data["object_id"]),
-    )
-
-
-# ---------------- ADMIN: OSHPAZ TAYINLASH ----------------
-@dp.callback_query(F.data.startswith("admin_addcook_"))
-async def admin_addcook(call: types.CallbackQuery, state: FSMContext):
-    object_id = int(call.data.split("_")[-1])
-    await state.update_data(object_id=object_id)
-    await state.set_state(Form.add_cook_username)
-    await call.message.edit_text("Oshpazning Telegram username'ini kiriting:")
+@dp.callback_query(F.data.startswith("emp_role_"))
+async def emp_role_picked(call: types.CallbackQuery, state: FSMContext):
+    # format: emp_role_manager_{id}  yoki  emp_role_cook_{id}
+    parts = call.data.split("_")
+    role = parts[2]  # "manager" yoki "cook"
+    object_id = int(parts[3])
+    await state.update_data(object_id=object_id, role=role)
+    await state.set_state(Form.emp_username)
+    await call.message.edit_text("Xodimning Telegram username'ini kiriting (masalan: @alivaliyev):")
     await call.answer()
 
 
-@dp.message(StateFilter(Form.add_cook_username))
-async def add_cook_entered(message: types.Message, state: FSMContext):
+@dp.message(StateFilter(Form.emp_username))
+async def emp_username_entered(message: types.Message, state: FSMContext):
+    await state.update_data(username=norm_username(message.text))
+    await state.set_state(Form.emp_fullname)
+    await message.answer("Xodimning F.I.Sh (Familiya Ism) kiriting (masalan: Sheraliyev Abror):")
+
+
+@dp.message(StateFilter(Form.emp_fullname))
+async def emp_fullname_entered(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    username = norm_username(message.text)
+    object_id = data["object_id"]
+    role = data["role"]
+    username = data["username"]
+    full_name = message.text.strip()
+
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            "INSERT INTO pending_roles (username, role, object_id) VALUES (?, 'cook', ?)",
-            (username, data["object_id"]),
+            "INSERT INTO pending_roles (username, role, object_id, full_name) VALUES (?, ?, ?, ?)",
+            (username, role, object_id, full_name),
         )
         await db.commit()
+
     await state.clear()
+    role_label = "Ish boshqaruvchi" if role == "manager" else "Oshpaz"
     await message.answer(
-        f"✅ @{username} oshpaz sifatida belgilandi. U /start bosganida panel ochiladi.",
-        reply_markup=admin_menu(data["object_id"]),
+        f"✅ @{username} ({full_name}) {role_label.lower()} sifatida belgilandi. "
+        f"U /start bosganida panel avtomatik ochiladi.",
+        reply_markup=admin_menu(object_id),
     )
 
 
-# ---------------- ADMIN: OSHPAZLARNI BIRLASHTIRISH ----------------
-@dp.callback_query(F.data.startswith("admin_merge_"))
-async def admin_merge(call: types.CallbackQuery, state: FSMContext):
+# ---------------- OBYEKT EGASI: XODIMLAR RO'YXATI ----------------
+@dp.callback_query(F.data.startswith("emp_list_"))
+async def emp_list(call: types.CallbackQuery):
+    object_id = int(call.data.split("_")[-1])
+    lines = []
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT full_name FROM managers WHERE object_id = ?", (object_id,)
+        ) as cur:
+            mgr = await cur.fetchone()
+        if mgr:
+            lines.append(f"👷 Ish boshqaruvchi: {mgr[0] or '(ism kiritilmagan)'}")
+
+        async with db.execute(
+            "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
+        ) as cur:
+            grp = await cur.fetchone()
+        if grp:
+            async with db.execute(
+                "SELECT full_name FROM cooks WHERE group_id = ?", (grp[0],)
+            ) as cur:
+                cooks = await cur.fetchall()
+            for c in cooks:
+                lines.append(f"👨‍🍳 Oshpaz: {c[0] or '(ism kiritilmagan)'}")
+
+        async with db.execute(
+            "SELECT username, role, full_name FROM pending_roles WHERE object_id = ?", (object_id,)
+        ) as cur:
+            pending = await cur.fetchall()
+        for uname, role, fname in pending:
+            role_label = "Ish boshqaruvchi" if role == "manager" else "Oshpaz"
+            lines.append(f"⏳ @{uname} ({fname}) — {role_label} (hali /start bosmagan)")
+
+    text = "📋 Xodimlar ro'yxati:\n\n" + ("\n".join(lines) if lines else "Hali xodim yo'q.")
+    await call.message.edit_text(text, reply_markup=admin_menu(object_id))
+    await call.answer()
+
+
+# ---------------- BOSH ADMIN: OBYEKTLARNI BIRLASHTIRISH ----------------
+@dp.callback_query(F.data == "sadmin_merge_pick")
+async def sadmin_merge_pick(call: types.CallbackQuery):
+    role, _ = await get_role_and_objects(call.from_user.id)
+    if role != "super":
+        return await call.answer("Bu funksiya faqat bosh admin uchun.", show_alert=True)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, nomi FROM objects") as cur:
+            objects = await cur.fetchall()
+
+    if not objects:
+        return await call.answer("Hali obyekt yo'q.", show_alert=True)
+
+    b = InlineKeyboardBuilder()
+    for oid, nomi in objects:
+        b.button(text=nomi, callback_data=f"sadmin_merge_src_{oid}")
+    b.button(text="⬅️ Ortga", callback_data="sadmin_back")
+    b.adjust(1)
+    await call.message.edit_text(
+        "Qaysi obyektning oshpazini boshqasiga birlashtirmoqchisiz? Obyektni tanlang:",
+        reply_markup=b.as_markup(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sadmin_merge_src_"))
+async def sadmin_merge_src(call: types.CallbackQuery, state: FSMContext):
     object_id = int(call.data.split("_")[-1])
     await state.update_data(object_id=object_id)
     await state.set_state(Form.merge_cook_username)
     await call.message.edit_text(
-        "Ushbu obyektning oshpazini QAYSI BOSHQA obyektdagi oshpaz bilan bitta guruh qilib "
-        "birlashtirmoqchisiz? O'sha oshpazning Telegram username'ini kiriting "
-        "(u allaqachon botdan /start bosgan bo'lishi kerak):"
+        "Bu obyektni QAYSI oshpazning guruhiga birlashtirmoqchisiz? "
+        "O'sha oshpazning Telegram username'ini kiriting "
+        "(u avval kamida bir marta botga /start bosgan bo'lishi kerak):"
     )
     await call.answer()
 
@@ -428,6 +494,8 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
     data = await state.get_data()
     object_id = data["object_id"]
     username = norm_username(message.text)
+    actor_role, actor_ids = await get_role_and_objects(message.from_user.id)
+    back_markup = super_menu() if actor_role == "super" else admin_menu(object_id)
 
     async with aiosqlite.connect(DB_NAME) as db:
         # 1) o'sha username qaysi telegram_id ekanini topamiz
@@ -441,7 +509,7 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
             return await message.answer(
                 f"❌ @{username} hali botga umuman murojaat qilmagan. "
                 f"Avval o'sha odamga botga /start bosishini so'rang, so'ng qayta urinib ko'ring.",
-                reply_markup=admin_menu(object_id),
+                reply_markup=back_markup,
             )
         target_id = target_user[0]
 
@@ -456,7 +524,7 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
             return await message.answer(
                 f"❌ @{username} hali hech qanday obyektda oshpaz sifatida tayinlanmagan. "
                 f"Avval uni biror obyektga oshpaz qilib tayinlang, so'ng birlashtiring.",
-                reply_markup=admin_menu(object_id),
+                reply_markup=back_markup,
             )
         target_group = target_cook[0]
 
@@ -469,7 +537,7 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
         if current and current[0] == target_group:
             await state.clear()
             return await message.answer(
-                "Bu ikkalasi allaqachon bitta guruhda.", reply_markup=admin_menu(object_id)
+                "Bu ikkalasi allaqachon bitta guruhda.", reply_markup=back_markup
             )
 
         if current:
@@ -493,9 +561,8 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
     await message.answer(
         f"✅ Birlashtirildi! Endi bu obyekt va @{username} bir xil oshpaz guruhida — "
         f"barchasi umumiy ishchilar sonini ko'radi.",
-        reply_markup=admin_menu(object_id),
+        reply_markup=back_markup,
     )
-
 
 # ---------------- ADMIN: HISOBOT ----------------
 @dp.callback_query(F.data.startswith("admin_report_"))
