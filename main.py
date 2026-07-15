@@ -128,19 +128,32 @@ async def resolve_pending(db, telegram_id: int, username: str | None):
                 (telegram_id, object_id),
             )
         elif role == "cook":
+            # Agar bu odam allaqachon boshqa joyda oshpaz bo'lsa, o'sha guruhini ishlatamiz.
             async with db.execute(
                 "SELECT group_id FROM cooks WHERE telegram_id = ?", (telegram_id,)
             ) as c2:
                 existing = await c2.fetchone()
-            if existing:
+
+            # Agar bu OBYEKT allaqachon biror guruhga bog'langan bo'lsa (masalan boshqa
+            # oshpaz orqali), yangi oshpazni ham O'SHA guruhga qo'shamiz — shunda bitta
+            # obyektga bir nechta oshpaz (4 tagacha va undan ko'p ham) biriktirilishi mumkin.
+            async with db.execute(
+                "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
+            ) as c3:
+                object_group = await c3.fetchone()
+
+            if object_group:
+                group_id = object_group[0]
+            elif existing:
                 group_id = existing[0]
             else:
                 cur2 = await db.execute("INSERT INTO cook_groups DEFAULT VALUES")
                 group_id = cur2.lastrowid
-                await db.execute(
-                    "INSERT INTO cooks (telegram_id, group_id) VALUES (?, ?)",
-                    (telegram_id, group_id),
-                )
+
+            await db.execute(
+                "INSERT OR REPLACE INTO cooks (telegram_id, group_id) VALUES (?, ?)",
+                (telegram_id, group_id),
+            )
             await db.execute(
                 "INSERT OR REPLACE INTO object_cook_group (object_id, group_id) VALUES (?, ?)",
                 (object_id, group_id),
