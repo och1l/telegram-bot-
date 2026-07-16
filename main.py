@@ -924,6 +924,8 @@ async def web_handler(request):
 
 async def main():
     await init_db()
+    # Eski (masalan qayta deploy paytida qolib ketgan) ulanishlarni tozalaymiz
+    await bot.delete_webhook(drop_pending_updates=True)
     app = web.Application()
     app.router.add_get("/", web_handler)
     runner = web.AppRunner(app)
