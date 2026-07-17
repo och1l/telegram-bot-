@@ -301,7 +301,13 @@ async def send_main_panel(message: types.Message):
     elif role == "cook":
         await show_cook_report(message.from_user.id, message)
     else:
-        await message.answer("🔑 Parolni kiriting:")
+        await message.answer(
+            f"🔑 Parolni kiriting:\n\n"
+            f"Yoki agar sizni admin/obyekt egasi/xodim sifatida tayinlashlari kerak bo'lsa, "
+            f"quyidagi ID raqamingizni ularga yuboring:\n\n"
+            f"`{message.from_user.id}`",
+            parse_mode="Markdown",
+        )
 
 
 @dp.message(Command("start"))
