@@ -49,6 +49,7 @@ class Form(StatesGroup):
     payment_amount = State()
     emp_username = State()
     emp_fullname = State()
+    emp_fullname_self = State()
 
 
 # ---------------- BAZA ----------------
@@ -58,6 +59,11 @@ async def init_db():
             "CREATE TABLE IF NOT EXISTS objects ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, nomi TEXT, owner_id INTEGER)"
         )
+        # Eski bazalarda bu ustun bo'lmasligi mumkin — xavfsiz qo'shamiz
+        try:
+            await db.execute("ALTER TABLE objects ADD COLUMN owner_full_name TEXT")
+        except Exception:
+            pass
         await db.execute(
             "CREATE TABLE IF NOT EXISTS managers ("
             "telegram_id INTEGER PRIMARY KEY, object_id INTEGER, full_name TEXT)"
@@ -210,6 +216,7 @@ def super_menu():
     b.button(text="🏗 Obyekt qo'shish", callback_data="sadmin_add_object")
     b.button(text="📋 Obyektlar ro'yxati", callback_data="sadmin_list_objects")
     b.button(text="🔗 Obyektlarni birlashtirish", callback_data="sadmin_merge_pick")
+    b.button(text="⚙️ Sozlamalar", callback_data="sadmin_settings")
     b.adjust(1)
     return b.as_markup()
 
@@ -219,6 +226,9 @@ def admin_menu(object_id: int):
     b.button(text="➕ Xodim qo'shish", callback_data=f"emp_add_{object_id}")
     b.button(text="📋 Xodimlar ro'yxati", callback_data=f"emp_list_{object_id}")
     b.button(text="📊 Hisobot", callback_data=f"admin_report_{object_id}")
+    b.button(text="🍲 Bugungi barcha obyektlar", callback_data="all_objects_today")
+    b.button(text="⚙️ Sozlamalar", callback_data=f"admin_settings_{object_id}")
+    b.button(text="⬅️ Ortga", callback_data="admin_menu_back")
     b.adjust(1)
     return b.as_markup()
 
@@ -297,6 +307,18 @@ async def start(message: types.Message, state: FSMContext):
         await message.answer("🔑 Parolni kiriting:")
 
 
+@dp.callback_query(F.data == "admin_menu_back")
+async def admin_menu_back(call: types.CallbackQuery):
+    role, ids = await get_role_and_objects(call.from_user.id)
+    if role == "super":
+        await sadmin_list_objects(call)
+    elif role == "admin" and ids:
+        await call.message.edit_text("🏗 Obyekt egasi paneli:", reply_markup=admin_menu(ids[0]))
+        await call.answer()
+    else:
+        await call.answer()
+
+
 @dp.callback_query(F.data.startswith("admin_select_"))
 async def admin_select(call: types.CallbackQuery):
     object_id = int(call.data.split("_")[-1])
@@ -363,14 +385,24 @@ async def obj_owner_entered(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "sadmin_list_objects")
 async def sadmin_list_objects(call: types.CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT nomi, owner_id FROM objects") as cur:
+        async with db.execute("SELECT id, nomi, owner_id FROM objects") as cur:
             rows = await cur.fetchall()
+
     if not rows:
-        text = "Hali obyektlar yo'q."
-    else:
-        lines = [f"🏗 {nomi} — {'egasi hali /start bosmagan' if not owner else 'faol'}" for nomi, owner in rows]
-        text = "\n".join(lines)
-    await call.message.edit_text(text, reply_markup=back_kb("sadmin_back"))
+        await call.message.edit_text("Hali obyektlar yo'q.", reply_markup=back_kb("sadmin_back"))
+        return await call.answer()
+
+    b = InlineKeyboardBuilder()
+    for oid, nomi, owner in rows:
+        holat = "✅" if owner else "⏳"
+        b.button(text=f"{holat} {nomi}", callback_data=f"admin_select_{oid}")
+    b.button(text="⬅️ Ortga", callback_data="sadmin_back")
+    b.adjust(1)
+    await call.message.edit_text(
+        "Obyektni tanlang (✅ — egasi faol, ⏳ — egasi hali /start bosmagan):\n"
+        "Siz bosh admin sifatida istalgan obyektni to'g'ridan-to'g'ri boshqarishingiz mumkin.",
+        reply_markup=b.as_markup(),
+    )
     await call.answer()
 
 
@@ -633,6 +665,200 @@ async def admin_report(call: types.CallbackQuery):
     )
     await call.message.edit_text(text, reply_markup=admin_menu(object_id))
     await call.answer()
+
+
+# ---------------- BARCHA OBYEKTLAR: BUGUNGI ISHCHILAR (faqat son, pul/ism yo'q) ----------------
+@dp.callback_query(F.data == "all_objects_today")
+async def all_objects_today(call: types.CallbackQuery):
+    bugun = date.today().isoformat()
+    lines = []
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, nomi FROM objects") as cur:
+            objects = await cur.fetchall()
+
+        for oid, nomi in objects:
+            async with db.execute(
+                "SELECT status FROM attendance a JOIN workers w ON a.worker_id = w.id "
+                "WHERE w.object_id = ? AND a.sana = ?",
+                (oid, bugun),
+            ) as cur:
+                statuses = await cur.fetchall()
+            soni = sum(STATUS_VALUE.get(s[0], 0) for s in statuses)
+            lines.append(f"🏗 {nomi}: {soni} kishi")
+
+    text = "🍲 Bugungi barcha obyektlar bo'yicha ishchilar soni:\n\n" + (
+        "\n".join(lines) if lines else "Hali obyekt yo'q."
+    )
+    role, ids = await get_role_and_objects(call.from_user.id)
+    markup = admin_menu(ids[0]) if role == "admin" and ids else super_menu()
+    await call.message.edit_text(text, reply_markup=markup)
+    await call.answer()
+
+
+# ---------------- OBYEKT EGASI: SOZLAMALAR ----------------
+@dp.callback_query(F.data.startswith("admin_settings_"))
+async def admin_settings(call: types.CallbackQuery):
+    object_id = int(call.data.split("_")[-1])
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Xodimni o'chirish", callback_data=f"del_emp_pick_{object_id}")
+    b.button(text="✏️ Mening ismim", callback_data=f"edit_myname_{object_id}")
+    b.button(text="⬅️ Ortga", callback_data=f"admin_select_{object_id}")
+    b.adjust(1)
+    await call.message.edit_text("⚙️ Sozlamalar:", reply_markup=b.as_markup())
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("del_emp_pick_"))
+async def del_emp_pick(call: types.CallbackQuery):
+    object_id = int(call.data.split("_")[-1])
+    b = InlineKeyboardBuilder()
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT telegram_id, full_name FROM managers WHERE object_id = ?", (object_id,)
+        ) as cur:
+            mgr = await cur.fetchone()
+        if mgr:
+            b.button(
+                text=f"👷 {mgr[1] or mgr[0]}",
+                callback_data=f"del_emp_do_manager_{mgr[0]}_{object_id}",
+            )
+
+        async with db.execute(
+            "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
+        ) as cur:
+            grp = await cur.fetchone()
+        if grp:
+            async with db.execute(
+                "SELECT telegram_id, full_name FROM cooks WHERE group_id = ?", (grp[0],)
+            ) as cur:
+                cooks = await cur.fetchall()
+            for tid, fname in cooks:
+                b.button(
+                    text=f"👨‍🍳 {fname or tid}",
+                    callback_data=f"del_emp_do_cook_{tid}_{object_id}",
+                )
+
+    b.button(text="⬅️ Ortga", callback_data=f"admin_settings_{object_id}")
+    b.adjust(1)
+    await call.message.edit_text("Kimni o'chirmoqchisiz?", reply_markup=b.as_markup())
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("del_emp_do_"))
+async def del_emp_do(call: types.CallbackQuery):
+    # format: del_emp_do_manager_{telegram_id}_{object_id}  yoki  del_emp_do_cook_{telegram_id}_{object_id}
+    parts = call.data.split("_")
+    emp_role = parts[3]
+    telegram_id = int(parts[4])
+    object_id = int(parts[5])
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        if emp_role == "manager":
+            await db.execute("DELETE FROM managers WHERE telegram_id = ?", (telegram_id,))
+        else:
+            await db.execute("DELETE FROM cooks WHERE telegram_id = ?", (telegram_id,))
+        await db.commit()
+
+    await call.answer("✅ O'chirildi.", show_alert=True)
+    await call.message.edit_text("⚙️ Sozlamalar:", reply_markup=None)
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Xodimni o'chirish", callback_data=f"del_emp_pick_{object_id}")
+    b.button(text="✏️ Mening ismim", callback_data=f"edit_myname_{object_id}")
+    b.button(text="⬅️ Ortga", callback_data=f"admin_select_{object_id}")
+    b.adjust(1)
+    await call.message.edit_reply_markup(reply_markup=b.as_markup())
+
+
+@dp.callback_query(F.data.startswith("edit_myname_"))
+async def edit_myname(call: types.CallbackQuery, state: FSMContext):
+    object_id = int(call.data.split("_")[-1])
+    await state.update_data(object_id=object_id)
+    await state.set_state(Form.emp_fullname_self)
+    await call.message.edit_text("Ismingizni kiriting (Familiya Ism):")
+    await call.answer()
+
+
+@dp.message(StateFilter(Form.emp_fullname_self))
+async def emp_fullname_self_entered(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    object_id = data["object_id"]
+    full_name = message.text.strip()
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE objects SET owner_full_name = ? WHERE id = ?", (full_name, object_id)
+        )
+        await db.commit()
+
+    await state.clear()
+    await message.answer(f"✅ Ismingiz saqlandi: {full_name}", reply_markup=admin_menu(object_id))
+
+
+# ---------------- BOSH ADMIN: SOZLAMALAR ----------------
+@dp.callback_query(F.data == "sadmin_settings")
+async def sadmin_settings(call: types.CallbackQuery):
+    b = InlineKeyboardBuilder()
+    b.button(text="🗑 Obyektni o'chirish", callback_data="sadmin_del_object_pick")
+    b.button(text="⬅️ Ortga", callback_data="sadmin_back")
+    b.adjust(1)
+    await call.message.edit_text(
+        "⚙️ Bosh admin sozlamalari:\n\n"
+        "Xodim o'chirish yoki ism qo'yish uchun — obyektlar ro'yxatidan kerakli obyektni tanlang, "
+        "u yerdagi ⚙️ Sozlamalar orqali amalga oshiring.",
+        reply_markup=b.as_markup(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "sadmin_del_object_pick")
+async def sadmin_del_object_pick(call: types.CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, nomi FROM objects") as cur:
+            objects = await cur.fetchall()
+
+    if not objects:
+        return await call.answer("Obyekt yo'q.", show_alert=True)
+
+    b = InlineKeyboardBuilder()
+    for oid, nomi in objects:
+        b.button(text=f"🗑 {nomi}", callback_data=f"sadmin_del_object_confirm_{oid}")
+    b.button(text="⬅️ Ortga", callback_data="sadmin_settings")
+    b.adjust(1)
+    await call.message.edit_text(
+        "⚠️ Qaysi obyektni o'chirmoqchisiz? (Bu obyektning barcha xodim, davomat va to'lov "
+        "ma'lumotlari ham butunlay o'chadi, orqaga qaytarib bo'lmaydi!)",
+        reply_markup=b.as_markup(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("sadmin_del_object_confirm_"))
+async def sadmin_del_object_confirm(call: types.CallbackQuery):
+    object_id = int(call.data.split("_")[-1])
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
+        ) as cur:
+            grp = await cur.fetchone()
+
+        async with db.execute("SELECT id FROM workers WHERE object_id = ?", (object_id,)) as cur:
+            worker_ids = [r[0] for r in await cur.fetchall()]
+
+        for wid in worker_ids:
+            await db.execute("DELETE FROM attendance WHERE worker_id = ?", (wid,))
+            await db.execute("DELETE FROM payments WHERE worker_id = ?", (wid,))
+
+        await db.execute("DELETE FROM workers WHERE object_id = ?", (object_id,))
+        await db.execute("DELETE FROM managers WHERE object_id = ?", (object_id,))
+        await db.execute("DELETE FROM object_cook_group WHERE object_id = ?", (object_id,))
+        await db.execute("DELETE FROM pending_roles WHERE object_id = ?", (object_id,))
+        await db.execute("DELETE FROM objects WHERE id = ?", (object_id,))
+        await db.commit()
+
+    await call.answer("✅ Obyekt butunlay o'chirildi.", show_alert=True)
+    await sadmin_list_objects(call)
 
 
 # ---------------- MANAGER: WORKER QO'SHISH ----------------
