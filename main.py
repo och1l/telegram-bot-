@@ -15,7 +15,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
 
 # ⚠️ Bu yerga @BotFather'dan olgan tokeningizni qo'ying
-TOKEN = "8821686299:AAHGqLVCYC2nwKHZkKXKdgrM6slhN-Jbrko"
+TOKEN = "8821686299:AAEIJ6t96GDNVwPXVXl3IMM_hIjbnRUB6ZM"
 
 # AI (Gemini) kaliti — Render'dagi Environment Variables bo'limiga GEMINI_API_KEY qo'shing
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
