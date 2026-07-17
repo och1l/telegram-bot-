@@ -215,6 +215,9 @@ def super_menu():
     b = InlineKeyboardBuilder()
     b.button(text="🏗 Obyekt qo'shish", callback_data="sadmin_add_object")
     b.button(text="📋 Obyektlar ro'yxati", callback_data="sadmin_list_objects")
+    b.button(text="➕ Xodim qo'shish", callback_data="sadmin_pick_empadd")
+    b.button(text="👥 Xodimlar ro'yxati", callback_data="sadmin_pick_emplist")
+    b.button(text="📊 Hisobot", callback_data="sadmin_pick_report")
     b.button(text="🔗 Obyektlarni birlashtirish", callback_data="sadmin_merge_pick")
     b.button(text="⚙️ Sozlamalar", callback_data="sadmin_settings")
     b.adjust(1)
@@ -521,6 +524,39 @@ async def emp_list(call: types.CallbackQuery):
     text = "📋 Xodimlar ro'yxati:\n\n" + ("\n".join(lines) if lines else "Hali xodim yo'q.")
     await call.message.edit_text(text, reply_markup=admin_menu(object_id))
     await call.answer()
+
+
+# ---------------- BOSH ADMIN: TEZKOR YO'LLAR (Xodim qo'shish/ro'yxati/hisobot) ----------------
+async def _sadmin_pick_object(call: types.CallbackQuery, prefix: str, title: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, nomi FROM objects") as cur:
+            objects = await cur.fetchall()
+
+    if not objects:
+        return await call.answer("Hali obyekt yo'q. Avval obyekt qo'shing.", show_alert=True)
+
+    b = InlineKeyboardBuilder()
+    for oid, nomi in objects:
+        b.button(text=nomi, callback_data=f"{prefix}{oid}")
+    b.button(text="⬅️ Ortga", callback_data="sadmin_back")
+    b.adjust(1)
+    await call.message.edit_text(title, reply_markup=b.as_markup())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "sadmin_pick_empadd")
+async def sadmin_pick_empadd(call: types.CallbackQuery):
+    await _sadmin_pick_object(call, "emp_add_", "Qaysi obyektga xodim qo'shasiz?")
+
+
+@dp.callback_query(F.data == "sadmin_pick_emplist")
+async def sadmin_pick_emplist(call: types.CallbackQuery):
+    await _sadmin_pick_object(call, "emp_list_", "Qaysi obyektning xodimlar ro'yxatini ko'rasiz?")
+
+
+@dp.callback_query(F.data == "sadmin_pick_report")
+async def sadmin_pick_report(call: types.CallbackQuery):
+    await _sadmin_pick_object(call, "admin_report_", "Qaysi obyektning hisobotini ko'rasiz?")
 
 
 # ---------------- BOSH ADMIN: OBYEKTLARNI BIRLASHTIRISH ----------------
