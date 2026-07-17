@@ -218,7 +218,6 @@ def super_menu():
     b.button(text="➕ Xodim qo'shish", callback_data="sadmin_pick_empadd")
     b.button(text="👥 Xodimlar ro'yxati", callback_data="sadmin_pick_emplist")
     b.button(text="📊 Hisobot", callback_data="sadmin_pick_report")
-    b.button(text="🔗 Obyektlarni birlashtirish", callback_data="sadmin_merge_pick")
     b.button(text="⚙️ Sozlamalar", callback_data="sadmin_settings")
     b.adjust(1)
     return b.as_markup()
@@ -280,12 +279,7 @@ async def claim_super_admin(message: types.Message):
 
 
 # ---------------- /start ----------------
-@dp.message(Command("start"))
-async def start(message: types.Message, state: FSMContext):
-    await state.clear()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await resolve_pending(db, message.from_user.id, message.from_user.username)
-
+async def send_main_panel(message: types.Message):
     role, ids = await get_role_and_objects(message.from_user.id)
 
     if role == "super":
@@ -308,6 +302,20 @@ async def start(message: types.Message, state: FSMContext):
         await show_cook_report(message.from_user.id, message)
     else:
         await message.answer("🔑 Parolni kiriting:")
+
+
+@dp.message(Command("start"))
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await resolve_pending(db, message.from_user.id, message.from_user.username)
+    await send_main_panel(message)
+
+
+@dp.message(Command("menu"))
+async def menu_command(message: types.Message, state: FSMContext):
+    await state.clear()
+    await send_main_panel(message)
 
 
 @dp.callback_query(F.data == "admin_menu_back")
@@ -1188,6 +1196,11 @@ async def main():
     await init_db()
     # Eski (masalan qayta deploy paytida qolib ketgan) ulanishlarni tozalaymiz
     await bot.delete_webhook(drop_pending_updates=True)
+    # Matn yozish joyi yonidagi "Menu" tugmasida /menu buyrug'i chiqishi uchun
+    await bot.set_my_commands([
+        types.BotCommand(command="menu", description="📋 Menyuni ochish"),
+        types.BotCommand(command="start", description="🔄 Botni qayta ishga tushirish"),
+    ])
     app = web.Application()
     app.router.add_get("/", web_handler)
     runner = web.AppRunner(app)
