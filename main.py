@@ -4,7 +4,7 @@ import logging
 import json
 from datetime import date, datetime
 
-import aiosqlite
+import asyncpg
 import google.generativeai as genai
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, StateFilter
@@ -26,7 +26,9 @@ if GEMINI_API_KEY:
 # Parolni ISHONCHLI SAQLANG — uni bilgan har kim botni to'liq boshqarib oladi.
 SUPER_ADMIN_PASSWORD = "w1234w4321"
 
-DB_NAME = "qurilish.db"
+# ⚠️ PostgreSQL ulanish manzili — Render'da Environment Variables bo'limiga DATABASE_URL
+# nomi bilan qo'shing (Supabase/Neon'dan olingan "connection string")
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -38,6 +40,131 @@ STATUS_LABELS = {
     "half_after": "🌓 Tushdan keyin (0.5)",
 }
 STATUS_VALUE = {"full": 1.0, "half_before": 0.5, "half_after": 0.5}
+
+
+# ==================== POSTGRESQL MOSLASHUV QATLAMI ====================
+# Bu qism aiosqlite'ning "async with aiosqlite.connect(...) as db: await db.execute(...)"
+# uslubidagi kodni o'zgartirmasdan PostgreSQL bilan ishlashini ta'minlaydi.
+
+_pool = None
+
+
+async def get_pool():
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "DATABASE_URL sozlanmagan! Render Environment Variables bo'limiga "
+                "PostgreSQL ulanish manzilini qo'shing."
+            )
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    return _pool
+
+
+def _qmark_to_dollar(query: str) -> str:
+    """'?' belgilarini PostgreSQL uchun '$1, $2, ...' formatiga o'tkazadi."""
+    parts = query.split("?")
+    out = parts[0]
+    for i, part in enumerate(parts[1:], start=1):
+        out += f"${i}" + part
+    return out
+
+
+class _PGCursor:
+    """aiosqlite.Cursor'ga o'xshab ishlaydi: fetchone/fetchall, lastrowid, async with."""
+
+    def __init__(self, rows=None, lastrowid=None):
+        self._rows = rows or []
+        self._i = 0
+        self.lastrowid = lastrowid
+
+    async def fetchone(self):
+        if self._i < len(self._rows):
+            row = self._rows[self._i]
+            self._i += 1
+            return row
+        return None
+
+    async def fetchall(self):
+        rows = self._rows[self._i:]
+        self._i = len(self._rows)
+        return rows
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _PGExecuteResult:
+    """db.execute(...) natijasi — ham 'await db.execute(...)', ham
+    'async with db.execute(...) as cur:' uslubida ishlatilishi mumkin
+    (aiosqlite'ning xuddi shu xususiyatini takrorlaydi)."""
+
+    def __init__(self, conn, query, params):
+        self._conn = conn
+        self._query = query
+        self._params = params
+
+    async def _run(self):
+        pg_query = _qmark_to_dollar(self._query.strip())
+        stripped_upper = pg_query.upper()
+
+        if stripped_upper.startswith("SELECT"):
+            records = await self._conn.fetch(pg_query, *self._params)
+            rows = [tuple(r) for r in records]
+            return _PGCursor(rows=rows)
+
+        if "RETURNING" in stripped_upper:
+            row = await self._conn.fetchrow(pg_query, *self._params)
+            lastrowid = row[0] if row else None
+            return _PGCursor(lastrowid=lastrowid)
+
+        await self._conn.execute(pg_query, *self._params)
+        return _PGCursor()
+
+    def __await__(self):
+        return self._run().__await__()
+
+    async def __aenter__(self):
+        self._cursor = await self._run()
+        return self._cursor
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _PGConn:
+    """aiosqlite.Connection'ga o'xshab ishlaydi."""
+
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def execute(self, query, params=()):
+        return _PGExecuteResult(self._conn, query, params)
+
+    async def commit(self):
+        # asyncpg avtomatik commit qiladi (aloxida tranzaksiya ochilmagan bo'lsa)
+        pass
+
+
+class db_connect:
+    """db_connect() o'rniga ishlatiladi."""
+
+    def __init__(self, *_args, **_kwargs):
+        self._raw = None
+
+    async def __aenter__(self):
+        pool = await get_pool()
+        self._raw = await pool.acquire()
+        return _PGConn(self._raw)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        pool = await get_pool()
+        await pool.release(self._raw)
+        return False
+# ==================== MOSLASHUV QATLAMI TUGADI ====================
 
 
 class Form(StatesGroup):
@@ -54,26 +181,22 @@ class Form(StatesGroup):
 
 # ---------------- BAZA ----------------
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await db.execute(
             "CREATE TABLE IF NOT EXISTS objects ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, nomi TEXT, owner_id INTEGER)"
+            "id SERIAL PRIMARY KEY, nomi TEXT, owner_id BIGINT)"
         )
-        # Eski bazalarda bu ustun bo'lmasligi mumkin — xavfsiz qo'shamiz
-        try:
-            await db.execute("ALTER TABLE objects ADD COLUMN owner_full_name TEXT")
-        except Exception:
-            pass
+        await db.execute("ALTER TABLE objects ADD COLUMN IF NOT EXISTS owner_full_name TEXT")
         await db.execute(
             "CREATE TABLE IF NOT EXISTS managers ("
-            "telegram_id INTEGER PRIMARY KEY, object_id INTEGER, full_name TEXT)"
+            "telegram_id BIGINT PRIMARY KEY, object_id INTEGER, full_name TEXT)"
         )
         await db.execute(
-            "CREATE TABLE IF NOT EXISTS cook_groups (id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            "CREATE TABLE IF NOT EXISTS cook_groups (id SERIAL PRIMARY KEY)"
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS cooks ("
-            "telegram_id INTEGER PRIMARY KEY, group_id INTEGER, full_name TEXT)"
+            "telegram_id BIGINT PRIMARY KEY, group_id INTEGER, full_name TEXT)"
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS object_cook_group ("
@@ -81,7 +204,7 @@ async def init_db():
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS workers ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, object_id INTEGER, ism TEXT)"
+            "id SERIAL PRIMARY KEY, object_id INTEGER, ism TEXT)"
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS attendance ("
@@ -89,21 +212,21 @@ async def init_db():
         )
         await db.execute(
             "CREATE TABLE IF NOT EXISTS payments ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id INTEGER, "
+            "id SERIAL PRIMARY KEY, worker_id INTEGER, "
             "summa INTEGER, sana_vaqt TEXT)"
         )
         # username orqali hali telegram_id'si noma'lum odamlarni "kutish" jadvali
         await db.execute(
-            "CREATE TABLE IF NOT EXISTS pending_roles ("
+            "CREATE TABLE IF NOT EXISTS pending_roles (id SERIAL PRIMARY KEY, "
             "username TEXT, role TEXT, object_id INTEGER, full_name TEXT)"
         )
         # har bir botga murojaat qilgan odamning username'ini eslab qolish uchun
         await db.execute(
-            "CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT)"
+            "CREATE TABLE IF NOT EXISTS users (telegram_id BIGINT PRIMARY KEY, username TEXT)"
         )
         # parol orqali bosh admin bo'lganlar
         await db.execute(
-            "CREATE TABLE IF NOT EXISTS super_admins (telegram_id INTEGER PRIMARY KEY)"
+            "CREATE TABLE IF NOT EXISTS super_admins (telegram_id BIGINT PRIMARY KEY)"
         )
         await db.commit()
 
@@ -111,9 +234,10 @@ async def init_db():
 async def remember_user(telegram_id: int, username: str | None):
     if not username:
         return
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO users (telegram_id, username) VALUES (?, ?)",
+            "INSERT INTO users (telegram_id, username) VALUES (?, ?) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username",
             (telegram_id, norm_username(username)),
         )
         await db.commit()
@@ -130,7 +254,9 @@ async def apply_role(db, telegram_id: int, role: str, object_id: int, full_name:
         await db.execute("UPDATE objects SET owner_id = ? WHERE id = ?", (telegram_id, object_id))
     elif role == "manager":
         await db.execute(
-            "INSERT OR REPLACE INTO managers (telegram_id, object_id, full_name) VALUES (?, ?, ?)",
+            "INSERT INTO managers (telegram_id, object_id, full_name) VALUES (?, ?, ?) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET "
+            "object_id = EXCLUDED.object_id, full_name = EXCLUDED.full_name",
             (telegram_id, object_id, full_name),
         )
     elif role == "cook":
@@ -149,15 +275,18 @@ async def apply_role(db, telegram_id: int, role: str, object_id: int, full_name:
         elif existing:
             group_id = existing[0]
         else:
-            cur2 = await db.execute("INSERT INTO cook_groups DEFAULT VALUES")
+            cur2 = await db.execute("INSERT INTO cook_groups DEFAULT VALUES RETURNING id")
             group_id = cur2.lastrowid
 
         await db.execute(
-            "INSERT OR REPLACE INTO cooks (telegram_id, group_id, full_name) VALUES (?, ?, ?)",
+            "INSERT INTO cooks (telegram_id, group_id, full_name) VALUES (?, ?, ?) "
+            "ON CONFLICT (telegram_id) DO UPDATE SET "
+            "group_id = EXCLUDED.group_id, full_name = EXCLUDED.full_name",
             (telegram_id, group_id, full_name),
         )
         await db.execute(
-            "INSERT OR REPLACE INTO object_cook_group (object_id, group_id) VALUES (?, ?)",
+            "INSERT INTO object_cook_group (object_id, group_id) VALUES (?, ?) "
+            "ON CONFLICT (object_id) DO UPDATE SET group_id = EXCLUDED.group_id",
             (object_id, group_id),
         )
     await db.commit()
@@ -169,19 +298,19 @@ async def resolve_pending(db, telegram_id: int, username: str | None):
         return
     uname = norm_username(username)
     async with db.execute(
-        "SELECT rowid, role, object_id, full_name FROM pending_roles WHERE username = ?", (uname,)
+        "SELECT id, role, object_id, full_name FROM pending_roles WHERE username = ?", (uname,)
     ) as cur:
         rows = await cur.fetchall()
 
-    for rowid, role, object_id, full_name in rows:
+    for pid, role, object_id, full_name in rows:
         await apply_role(db, telegram_id, role, object_id, full_name)
-        await db.execute("DELETE FROM pending_roles WHERE rowid = ?", (rowid,))
+        await db.execute("DELETE FROM pending_roles WHERE id = ?", (pid,))
     await db.commit()
 
 
 async def get_role_and_objects(telegram_id: int):
     """Qaytaradi: (rol, [object_id ...]) . rol: 'super', 'admin', 'manager', 'cook', None"""
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT 1 FROM super_admins WHERE telegram_id = ?", (telegram_id,)
         ) as cur:
@@ -265,9 +394,10 @@ async def remember_cb_user(handler, event: types.CallbackQuery, data):
 # ---------------- PAROL ORQALI BOSH ADMIN BO'LISH ----------------
 @dp.message(F.text == SUPER_ADMIN_PASSWORD)
 async def claim_super_admin(message: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await db.execute(
-            "INSERT OR IGNORE INTO super_admins (telegram_id) VALUES (?)", (message.from_user.id,)
+            "INSERT INTO super_admins (telegram_id) VALUES (?) ON CONFLICT (telegram_id) DO NOTHING",
+            (message.from_user.id,),
         )
         await db.commit()
     # Xavfsizlik uchun: parolni yozgan xabarni chatdan o'chirishga harakat qilamiz
@@ -289,7 +419,7 @@ async def send_main_panel(message: types.Message):
             await message.answer("🏗 Obyekt egasi paneli:", reply_markup=admin_menu(ids[0]))
         else:
             b = InlineKeyboardBuilder()
-            async with aiosqlite.connect(DB_NAME) as db:
+            async with db_connect() as db:
                 for oid in ids:
                     async with db.execute("SELECT nomi FROM objects WHERE id = ?", (oid,)) as cur:
                         nomi = (await cur.fetchone())[0]
@@ -313,7 +443,7 @@ async def send_main_panel(message: types.Message):
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await resolve_pending(db, message.from_user.id, message.from_user.username)
     await send_main_panel(message)
 
@@ -374,7 +504,7 @@ async def obj_owner_entered(message: types.Message, state: FSMContext):
         )
 
     owner_id = int(raw)
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         cur = await db.execute(
             "INSERT INTO objects (nomi, owner_id) VALUES (?, ?)", (data["obj_name"], owner_id)
         )
@@ -390,7 +520,7 @@ async def obj_owner_entered(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "sadmin_list_objects")
 async def sadmin_list_objects(call: types.CallbackQuery):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, nomi, owner_id FROM objects") as cur:
             rows = await cur.fetchall()
 
@@ -469,7 +599,7 @@ async def emp_fullname_entered(message: types.Message, state: FSMContext):
     full_name = message.text.strip()
     role_label = "Ish boshqaruvchi" if role == "manager" else "Oshpaz"
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await apply_role(db, telegram_id, role, object_id, full_name)
 
     await state.clear()
@@ -486,7 +616,7 @@ async def emp_list(call: types.CallbackQuery):
     object_id = int(call.data.split("_")[-1])
     lines = []
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT full_name FROM managers WHERE object_id = ?", (object_id,)
         ) as cur:
@@ -521,7 +651,7 @@ async def emp_list(call: types.CallbackQuery):
 
 # ---------------- BOSH ADMIN: TEZKOR YO'LLAR (Xodim qo'shish/ro'yxati/hisobot) ----------------
 async def _sadmin_pick_object(call: types.CallbackQuery, prefix: str, title: str):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, nomi FROM objects") as cur:
             objects = await cur.fetchall()
 
@@ -559,7 +689,7 @@ async def sadmin_merge_pick(call: types.CallbackQuery):
     if role != "super":
         return await call.answer("Bu funksiya faqat bosh admin uchun.", show_alert=True)
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, nomi FROM objects") as cur:
             objects = await cur.fetchall()
 
@@ -604,7 +734,7 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
         return await message.answer("❌ Bu ID raqam emas.", reply_markup=back_markup)
     target_id = int(raw)
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         # o'sha odam allaqachon biror obyektda oshpaz sifatida ro'yxatdan o'tganmi
         async with db.execute(
             "SELECT group_id FROM cooks WHERE telegram_id = ?", (target_id,)
@@ -643,7 +773,8 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
             )
         else:
             await db.execute(
-                "INSERT OR REPLACE INTO object_cook_group (object_id, group_id) VALUES (?, ?)",
+                "INSERT INTO object_cook_group (object_id, group_id) VALUES (?, ?) "
+                "ON CONFLICT (object_id) DO UPDATE SET group_id = EXCLUDED.group_id",
                 (object_id, target_group),
             )
 
@@ -662,7 +793,7 @@ async def admin_report(call: types.CallbackQuery):
     object_id = int(call.data.split("_")[-1])
     bugun = date.today().isoformat()
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT COUNT(*) FROM attendance a JOIN workers w ON a.worker_id = w.id "
             "WHERE w.object_id = ? AND a.sana = ?",
@@ -691,7 +822,7 @@ async def admin_report(call: types.CallbackQuery):
 async def all_objects_today(call: types.CallbackQuery):
     bugun = date.today().isoformat()
     lines = []
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, nomi FROM objects") as cur:
             objects = await cur.fetchall()
 
@@ -732,7 +863,7 @@ async def del_emp_pick(call: types.CallbackQuery):
     object_id = int(call.data.split("_")[-1])
     b = InlineKeyboardBuilder()
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT telegram_id, full_name FROM managers WHERE object_id = ?", (object_id,)
         ) as cur:
@@ -772,7 +903,7 @@ async def del_emp_do(call: types.CallbackQuery):
     telegram_id = int(parts[4])
     object_id = int(parts[5])
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         if emp_role == "manager":
             await db.execute("DELETE FROM managers WHERE telegram_id = ?", (telegram_id,))
         else:
@@ -804,7 +935,7 @@ async def emp_fullname_self_entered(message: types.Message, state: FSMContext):
     object_id = data["object_id"]
     full_name = message.text.strip()
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await db.execute(
             "UPDATE objects SET owner_full_name = ? WHERE id = ?", (full_name, object_id)
         )
@@ -832,7 +963,7 @@ async def sadmin_settings(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "sadmin_del_object_pick")
 async def sadmin_del_object_pick(call: types.CallbackQuery):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, nomi FROM objects") as cur:
             objects = await cur.fetchall()
 
@@ -856,7 +987,7 @@ async def sadmin_del_object_pick(call: types.CallbackQuery):
 async def sadmin_del_object_confirm(call: types.CallbackQuery):
     object_id = int(call.data.split("_")[-1])
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
         ) as cur:
@@ -888,7 +1019,7 @@ async def add_ishchi(message: types.Message):
         return
     object_id = ids[0]
     ism = message.text.split(" ", 1)[1].strip().lower()
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await db.execute("INSERT INTO workers (object_id, ism) VALUES (?, ?)", (object_id, ism))
         await db.commit()
     await message.answer(f"✅ {ism.upper()} ishchi sifatida qo'shildi.")
@@ -902,7 +1033,7 @@ async def mgr_attendance(call: types.CallbackQuery):
         return await call.answer("Ruxsat yo'q.", show_alert=True)
     object_id = ids[0]
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, ism FROM workers WHERE object_id = ?", (object_id,)) as cur:
             workers = await cur.fetchall()
 
@@ -936,7 +1067,7 @@ async def att_set(call: types.CallbackQuery):
     worker_id = int(worker_id)
     bugun = date.today().isoformat()
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await db.execute(
             "INSERT INTO attendance (worker_id, sana, status) VALUES (?, ?, ?) "
             "ON CONFLICT(worker_id, sana) DO UPDATE SET status = excluded.status",
@@ -962,7 +1093,7 @@ async def mgr_payment(call: types.CallbackQuery):
         return await call.answer("Ruxsat yo'q.", show_alert=True)
     object_id = ids[0]
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, ism FROM workers WHERE object_id = ?", (object_id,)) as cur:
             workers = await cur.fetchall()
 
@@ -996,7 +1127,7 @@ async def payment_amount_entered(message: types.Message, state: FSMContext):
     summa = int(message.text)
     vaqt = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         await db.execute(
             "INSERT INTO payments (worker_id, summa, sana_vaqt) VALUES (?, ?, ?)",
             (data["worker_id"], summa, vaqt),
@@ -1018,7 +1149,7 @@ async def mgr_report(call: types.CallbackQuery):
     object_id = ids[0]
 
     lines = []
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute("SELECT id, ism FROM workers WHERE object_id = ?", (object_id,)) as cur:
             workers = await cur.fetchall()
 
@@ -1043,7 +1174,7 @@ async def mgr_report(call: types.CallbackQuery):
 
 # ---------------- COOK: HISOBOT ----------------
 async def show_cook_report(telegram_id: int, message: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT group_id FROM cooks WHERE telegram_id = ?", (telegram_id,)
         ) as cur:
@@ -1139,7 +1270,7 @@ async def ai_handler(message: types.Message):
     if status not in STATUS_LABELS:
         return await status_msg.edit_text("❌ AI holatni aniqlay olmadi. Qayta urinib ko'ring.")
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT id FROM workers WHERE ism = ? AND object_id = ?", (ism, object_id)
         ) as cur:
