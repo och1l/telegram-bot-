@@ -355,7 +355,11 @@ async def sadmin_add_object(call: types.CallbackQuery, state: FSMContext):
 async def obj_name_entered(message: types.Message, state: FSMContext):
     await state.update_data(obj_name=message.text.strip())
     await state.set_state(Form.obj_owner_username)
-    await message.answer("Obyekt egasining Telegram username'ini kiriting (masalan: @alivaliyev):")
+    await message.answer(
+        "Obyekt egasining Telegram ID raqamini kiriting.\n\n"
+        "ID raqamini bilish uchun o'sha odamdan botga /start bosishini so'rang — "
+        "unga ekranda o'z ID raqami ko'rsatiladi, o'shani shu yerga yuborsin yoki sizga jo'natsin."
+    )
 
 
 @dp.message(StateFilter(Form.obj_owner_username))
@@ -363,38 +367,23 @@ async def obj_owner_entered(message: types.Message, state: FSMContext):
     data = await state.get_data()
     raw = message.text.strip()
 
+    if not raw.lstrip("-").isdigit():
+        return await message.answer(
+            "❌ Bu ID raqam emas. Iltimos, faqat raqam kiriting (masalan: 123456789). "
+            "Odamning ID raqamini bilish uchun u botga /start bosishi kerak — ekranda chiqadi."
+        )
+
+    owner_id = int(raw)
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "INSERT INTO objects (nomi, owner_id) VALUES (?, NULL)", (data["obj_name"],)
-        )
-        object_id = cur.lastrowid
-
-        if raw.lstrip("-").isdigit():
-            # Raqamli Telegram ID kiritilgan — darhol tayinlaymiz, kutish shart emas
-            owner_id = int(raw)
-            await db.execute("UPDATE objects SET owner_id = ? WHERE id = ?", (owner_id, object_id))
-            await db.commit()
-            await state.clear()
-            return await message.answer(
-                f"✅ '{data['obj_name']}' obyekti yaratildi va ID {owner_id} darhol egasi qilib "
-                f"tayinlandi. U /start bossa, paneli ochiladi.",
-                reply_markup=super_menu(),
-            )
-
-        username = norm_username(raw)
-        await db.execute(
-            "INSERT INTO pending_roles (username, role, object_id) VALUES (?, 'admin', ?)",
-            (username, object_id),
+            "INSERT INTO objects (nomi, owner_id) VALUES (?, ?)", (data["obj_name"], owner_id)
         )
         await db.commit()
 
     await state.clear()
     await message.answer(
-        f"✅ '{data['obj_name']}' obyekti yaratildi.\n"
-        f"@{username} birinchi marta botga /start bosganida, u avtomatik shu obyekt egasi bo'ladi.\n\n"
-        f"⚠️ Agar @{username}da Telegram username o'rnatilmagan bo'lsa, bu ISHLAMAYDI. "
-        f"Bunday holda o'sha odamdan @userinfobot orqali raqamli ID olib, shu joyga username "
-        f"o'rniga o'sha RAQAMni kiritish kerak edi.",
+        f"✅ '{data['obj_name']}' obyekti yaratildi va ID {owner_id} darhol egasi qilib "
+        f"tayinlandi. U /start bossa, o'z paneli ochiladi.",
         reply_markup=super_menu(),
     )
 
@@ -451,14 +440,22 @@ async def emp_role_picked(call: types.CallbackQuery, state: FSMContext):
     object_id = int(parts[3])
     await state.update_data(object_id=object_id, role=role)
     await state.set_state(Form.emp_username)
-    await call.message.edit_text("Xodimning Telegram username'ini kiriting (masalan: @alivaliyev):")
+    await call.message.edit_text(
+        "Xodimning Telegram ID raqamini kiriting.\n\n"
+        "ID raqamini bilish uchun o'sha odam botga /start bosishi kerak — ekranda o'z ID "
+        "raqami ko'rsatiladi, o'shani sizga yuborsin."
+    )
     await call.answer()
 
 
 @dp.message(StateFilter(Form.emp_username))
 async def emp_username_entered(message: types.Message, state: FSMContext):
     raw = message.text.strip()
-    await state.update_data(raw_input=raw)
+    if not raw.lstrip("-").isdigit():
+        return await message.answer(
+            "❌ Bu ID raqam emas. Iltimos, faqat raqam kiriting (masalan: 123456789)."
+        )
+    await state.update_data(telegram_id=int(raw))
     await state.set_state(Form.emp_fullname)
     await message.answer("Xodimning F.I.Sh (Familiya Ism) kiriting (masalan: Sheraliyev Abror):")
 
@@ -468,35 +465,17 @@ async def emp_fullname_entered(message: types.Message, state: FSMContext):
     data = await state.get_data()
     object_id = data["object_id"]
     role = data["role"]
-    raw = data["raw_input"]
+    telegram_id = data["telegram_id"]
     full_name = message.text.strip()
     role_label = "Ish boshqaruvchi" if role == "manager" else "Oshpaz"
 
     async with aiosqlite.connect(DB_NAME) as db:
-        if raw.lstrip("-").isdigit():
-            # Raqamli Telegram ID kiritilgan — darhol tayinlaymiz, username shart emas
-            telegram_id = int(raw)
-            await apply_role(db, telegram_id, role, object_id, full_name)
-            await state.clear()
-            return await message.answer(
-                f"✅ ID {telegram_id} ({full_name}) {role_label.lower()} sifatida darhol tayinlandi. "
-                f"U /start bossa, paneli ochiladi.",
-                reply_markup=admin_menu(object_id),
-            )
-
-        username = norm_username(raw)
-        await db.execute(
-            "INSERT INTO pending_roles (username, role, object_id, full_name) VALUES (?, ?, ?, ?)",
-            (username, role, object_id, full_name),
-        )
-        await db.commit()
+        await apply_role(db, telegram_id, role, object_id, full_name)
 
     await state.clear()
     await message.answer(
-        f"✅ @{username} ({full_name}) {role_label.lower()} sifatida belgilandi. "
-        f"U /start bosganida panel avtomatik ochiladi.\n\n"
-        f"⚠️ Agar @{username}da Telegram username o'rnatilmagan bo'lsa, bu ISHLAMAYDI — "
-        f"bunday holda uning @userinfobot orqali olingan raqamli ID'sini kiriting.",
+        f"✅ ID {telegram_id} ({full_name}) {role_label.lower()} sifatida darhol tayinlandi. "
+        f"U /start bossa, o'z paneli ochiladi.",
         reply_markup=admin_menu(object_id),
     )
 
@@ -606,8 +585,8 @@ async def sadmin_merge_src(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.merge_cook_username)
     await call.message.edit_text(
         "Bu obyektni QAYSI oshpazning guruhiga birlashtirmoqchisiz? "
-        "O'sha oshpazning Telegram username'ini kiriting "
-        "(u avval kamida bir marta botga /start bosgan bo'lishi kerak):"
+        "O'sha oshpazning Telegram ID raqamini kiriting "
+        "(u avval kamida bir marta oshpaz sifatida tayinlangan bo'lishi kerak):"
     )
     await call.answer()
 
@@ -616,27 +595,17 @@ async def sadmin_merge_src(call: types.CallbackQuery, state: FSMContext):
 async def merge_cook_entered(message: types.Message, state: FSMContext):
     data = await state.get_data()
     object_id = data["object_id"]
-    username = norm_username(message.text)
+    raw = message.text.strip()
     actor_role, actor_ids = await get_role_and_objects(message.from_user.id)
     back_markup = super_menu() if actor_role == "super" else admin_menu(object_id)
 
+    if not raw.lstrip("-").isdigit():
+        await state.clear()
+        return await message.answer("❌ Bu ID raqam emas.", reply_markup=back_markup)
+    target_id = int(raw)
+
     async with aiosqlite.connect(DB_NAME) as db:
-        # 1) o'sha username qaysi telegram_id ekanini topamiz
-        async with db.execute(
-            "SELECT telegram_id FROM users WHERE username = ?", (username,)
-        ) as cur:
-            target_user = await cur.fetchone()
-
-        if not target_user:
-            await state.clear()
-            return await message.answer(
-                f"❌ @{username} hali botga umuman murojaat qilmagan. "
-                f"Avval o'sha odamga botga /start bosishini so'rang, so'ng qayta urinib ko'ring.",
-                reply_markup=back_markup,
-            )
-        target_id = target_user[0]
-
-        # 2) o'sha odam allaqachon biror obyektda oshpaz sifatida ro'yxatdan o'tganmi
+        # o'sha odam allaqachon biror obyektda oshpaz sifatida ro'yxatdan o'tganmi
         async with db.execute(
             "SELECT group_id FROM cooks WHERE telegram_id = ?", (target_id,)
         ) as cur:
@@ -645,13 +614,13 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
         if not target_cook:
             await state.clear()
             return await message.answer(
-                f"❌ @{username} hali hech qanday obyektda oshpaz sifatida tayinlanmagan. "
+                f"❌ ID {target_id} hali hech qanday obyektda oshpaz sifatida tayinlanmagan. "
                 f"Avval uni biror obyektga oshpaz qilib tayinlang, so'ng birlashtiring.",
                 reply_markup=back_markup,
             )
         target_group = target_cook[0]
 
-        # 3) joriy obyektning hozirgi guruhini topamiz
+        # joriy obyektning hozirgi guruhini topamiz
         async with db.execute(
             "SELECT group_id FROM object_cook_group WHERE object_id = ?", (object_id,)
         ) as cur:
@@ -682,7 +651,7 @@ async def merge_cook_entered(message: types.Message, state: FSMContext):
 
     await state.clear()
     await message.answer(
-        f"✅ Birlashtirildi! Endi bu obyekt va @{username} bir xil oshpaz guruhida — "
+        f"✅ Birlashtirildi! Endi bu obyekt va ID {target_id} bir xil oshpaz guruhida — "
         f"barchasi umumiy ishchilar sonini ko'radi.",
         reply_markup=back_markup,
     )
